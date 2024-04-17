@@ -1,113 +1,700 @@
-import Image from 'next/image'
+'use client'
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { Connection, Keypair, PublicKey, Signer } from "@solana/web3.js";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+import {
+  createMintNeonTransaction,
+  createMintSolanaTransaction,
+  GasToken,
+  NEON_STATUS_DEVNET_SNAPSHOT,
+  NEON_TOKEN_MINT_DEVNET,
+  NEON_TRANSFER_CONTRACT_DEVNET,
+  neonNeonTransaction,
+  NeonProgramStatus,
+  NeonProxyRpcApi,
+  neonTransferMintWeb3Transaction,
+  SOL_TRANSFER_CONTRACT_DEVNET,
+  solanaNEONTransferTransaction,
+  solanaSOLTransferTransaction,
+  SPLToken,
+} from "@neonevm/token-transfer";
+import { decode } from "bs58";
+import Web3 from "web3";
+import { Big } from "big.js";
 
-export default function Home() {
+import {
+  CHAIN_ID,
+  delay,
+  mintTokenBalance,
+  NEON_PRIVATE,
+  NEON_TOKEN_MODEL,
+  neonBalance,
+  neonSignature,
+  sendSignedTransaction,
+  sendTransaction,
+  SOL_TOKEN_MODEL,
+  SOLANA_PRIVATE,
+  solanaBalance,
+  solanaSignature,
+  splTokenBalance,
+  stringShort,
+  TOKEN_LIST,
+  toSigner,
+} from "../utils";
+import { TokenBalance, TransferDirection, TransferSignature } from "../models";
+
+const BIG_ZERO = new Big(0);
+
+const networkUrls = [
+  {
+    id: 245022926,
+    token: "NEON",
+    solana: "https://api.devnet.solana.com",
+    neonProxy: "https://devnet.neonevm.org",
+  },
+  {
+    id: 245022927,
+    token: "SOL",
+    solana: "https://api.devnet.solana.com",
+    neonProxy: "https://devnet.neonevm.org/solana/sol",
+  },
+];
+
+function NeonTransferApp() {
+  const [token, setToken] = useState<string>("");
+  const [chainId, setChainId] = useState<any>(CHAIN_ID);
+  const [proxyStatus, setProxyStatus] = useState<NeonProgramStatus>(
+    NEON_STATUS_DEVNET_SNAPSHOT
+  );
+  const [gasTokens, setGasTokens] = useState<GasToken[]>([]);
+
+  // connect solana/neon networks
+  const networkUrl = useMemo(() => {
+    const id = networkUrls.findIndex((i) => i.id === chainId);
+    return id > -1 ? networkUrls[id] : networkUrls[0];
+  }, [chainId]);
+  const connection = useMemo(() => {
+    return new Connection(networkUrl.solana, "confirmed");
+  }, [networkUrl]);
+  const web3 = useMemo(() => {
+    const url = new Web3.providers.HttpProvider(networkUrl.neonProxy);
+    return new Web3(url);
+  }, [networkUrl]);
+
+  const proxyApi = useMemo(() => {
+    return new NeonProxyRpcApi({
+      neonProxyRpcApi: networkUrl.neonProxy,
+      solanaRpcApi: networkUrl.solana,
+    });
+  }, [networkUrl]);
+
+  // add account and keypayer
+  const solanaWallet = useMemo(() => {
+    return Keypair.fromSecretKey(decode(SOLANA_PRIVATE));
+  }, []);
+
+  const neonWallet = useMemo(() => {
+    return web3.eth.accounts.privateKeyToAccount(NEON_PRIVATE);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [web3]);
+
+  const neonProgram = useMemo(() => {
+    if (proxyStatus) {
+      return new PublicKey(proxyStatus?.NEON_EVM_ID!);
+    }
+    return new PublicKey(NEON_STATUS_DEVNET_SNAPSHOT.NEON_EVM_ID);
+  }, [proxyStatus]);
+
+  const networkTokenMint = useMemo(() => {
+    const id = gasTokens.findIndex(
+      (i) => parseInt(i.token_chain_id, 16) === chainId
+    );
+    if (id > -1) {
+      return new PublicKey(gasTokens[id].token_mint);
+    }
+    return new PublicKey(NEON_TOKEN_MINT_DEVNET);
+  }, [gasTokens, chainId]);
+
+  const [tokenBalance, setTokenBalance] = useState<TokenBalance>({
+    neon: BIG_ZERO.toString(),
+    solana: BIG_ZERO.toString(),
+  });
+  
+  const [walletBalance, setWalletBalance] = useState<TokenBalance>({
+    neon: BIG_ZERO.toString(),
+    solana: BIG_ZERO.toString(),
+  });
+  const [amount, setAmount] = useState<string>("0.1");
+  const [transfer, setTransfer] = useState<TransferDirection>({
+    direction: "solana",
+    from: solanaWallet.publicKey.toBase58(),
+    to: neonWallet.address.toString(),
+  });
+  const [signature, setSignature] = useState<Partial<TransferSignature>>({
+    solana: "",
+    neon: "",
+  });
+  const [submitDisable, setSubmitDisable] = useState<boolean>(false);
+
+  const tokenList = useMemo<SPLToken[]>(() => {
+    const supported = ["wSOL", "USDT", "USDC"];
+    const tokens = TOKEN_LIST.filter((i) => supported.includes(i.symbol));
+    if (chainId === networkUrls[0].id) {
+      tokens.unshift({
+        ...NEON_TOKEN_MODEL,
+        address_spl: networkTokenMint.toBase58(),
+      });
+    } else {
+      const wSOL = tokens.find((i) => i.symbol === "wSOL");
+      tokens.unshift({
+        ...wSOL,
+        ...SOL_TOKEN_MODEL,
+        address_spl: networkTokenMint.toBase58(),
+      });
+    }
+    return tokens;
+  }, [chainId, networkTokenMint]);
+
+  const splToken = useMemo(() => {
+    const index = tokenList.findIndex((i) => i.symbol === token);
+    if (index > -1) {
+      return tokenList[index];
+    }
+    return null;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
+
+  const disabled = useMemo(() => {
+    const balance = tokenBalance[transfer.direction];
+    return submitDisable || Big(balance).eq(0) || Big(amount).gt(Big(balance));
+  }, [amount, submitDisable, tokenBalance, transfer.direction]);
+
+  // const amountView = useMemo(() => {
+  //   const balance = tokenBalance[transfer.direction];
+  //   return `${balance.gt(0) ? balance.toFixed(3) : ""}${
+  //     splToken?.symbol ? ` ${splToken.symbol}` : ""
+  //   }`;
+  // }, [tokenBalance, transfer.direction, splToken]);
+  const amountView = useMemo(() => {
+    const balance = new Big(tokenBalance[transfer.direction]);
+    return `${balance.gt(0) ? balance.toFixed(3) : ""}${
+      splToken?.symbol ? ` ${splToken.symbol}` : ""
+    }`;
+}, [tokenBalance, transfer.direction, splToken]);
+
+  const handleSelect = (event: any): any => {
+    setToken(event.target.value);
+    setSignature({});
+  };
+
+  const handleEvmNetworkSelect = (event: any): any => {
+    setChainId(Number(event.target.value));
+    setToken("");
+    setSignature({});
+    setTokenBalance({ solana: BIG_ZERO.toString(), neon: BIG_ZERO.toString() });
+  };
+
+  const handleAmount = (event: any): any => {
+    setAmount(event.target.value);
+    setSignature({});
+  };
+
+  const handleTransferDirection = (): any => {
+    const isSolanaDirection = transfer.direction === "solana";
+    const changeDirection: TransferDirection = {
+      direction: isSolanaDirection ? "neon" : "solana",
+      from: isSolanaDirection
+        ? neonWallet.address.toString()
+        : solanaWallet.publicKey.toBase58(),
+      to: isSolanaDirection
+        ? solanaWallet.publicKey.toBase58()
+        : neonWallet.address.toString(),
+    };
+    setTransfer(changeDirection);
+    setSignature({});
+  };
+
+  // const getWalletBalance = useCallback(async () => {
+  //   const solana = await solanaBalance(connection, solanaWallet.publicKey);
+  //   const neon = await neonBalance(web3, neonWallet.address);
+  //   setWalletBalance({ solana, neon });
+  //   // eslint-disable-next-line react-hooks/exhaustive-deps
+  // }, [web3]);
+  const getWalletBalance = useCallback(async () => {
+    const solanaBig = await solanaBalance(connection, solanaWallet.publicKey);
+    const neonBig = await neonBalance(web3, neonWallet.address);
+    const solana = solanaBig.toString(); // Convert Big to string
+    const neon = neonBig.toString(); // Convert Big to string
+    setWalletBalance({ solana, neon });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [web3]);
+
+  const getProxyStatus = useCallback(async () => {
+    const proxyStatus = await proxyApi.evmParams();
+    const gasTokens = await proxyApi.nativeTokenList();
+    setProxyStatus(proxyStatus);
+    setGasTokens(gasTokens);
+  }, [proxyApi]);
+
+  const directionBalance = (position: "from" | "to"): string => {
+    const evmToken = `${networkUrl.token} NeonEVM`;
+    const solana = `SOL Solana`;
+    switch (position) {
+      case "from": {
+        const token = transfer.direction === "solana" ? solana : evmToken;
+        const balance = parseFloat(walletBalance[transfer.direction]); // Convert to number
+        return `${balance.toFixed(3)} ${token}`;
+      }
+      case "to": {
+        const to = transfer.direction === "solana" ? "neon" : "solana";
+        const token = transfer.direction === "solana" ? evmToken : solana;
+        const balance = parseFloat(walletBalance[to]); // Convert to number
+        return `${balance.toFixed(3)} ${token}`;
+      }
+    }
+};
+
+
+  const getTokenBalance = useCallback(async () => {
+    if (splToken) {
+      switch (splToken.symbol) {
+        case "NEON": {
+          const solana = await splTokenBalance(
+            connection,
+            solanaWallet.publicKey,
+            splToken
+          );
+          const neon = await neonBalance(web3, neonWallet.address);
+          setTokenBalance({
+            solana: new Big(solana.amount).div(Math.pow(10, solana.decimals)).toString(),
+            neon:neon.toString(),
+          });
+          break;
+        }
+        case "SOL": {
+          const solanaBig = await solanaBalance(connection, solanaWallet.publicKey);
+          const solana = solanaBig.toString(); // Convert Big to string
+          const neonBig = await neonBalance(web3, neonWallet.address);
+          const neon = neonBig.toString(); // Convert Big to string
+          setTokenBalance({ solana, neon });
+          break;
+        }
+        case "wSOL": {
+          const address = new PublicKey(splToken.address_spl);
+          const associatedToken = getAssociatedTokenAddressSync(
+            address,
+            solanaWallet.publicKey
+          );
+          const solanaBig = await solanaBalance(connection, associatedToken);
+          const solana = solanaBig.toString(); // Convert Big to string
+          const neon = await mintTokenBalance(web3, neonWallet.address, splToken);
+          setTokenBalance({ solana, neon:neon.toString() });
+          break;
+        }
+        
+        default: {
+          const solana = await splTokenBalance(
+            connection,
+            solanaWallet.publicKey,
+            splToken
+          );
+          const neon = await mintTokenBalance(
+            web3,
+            neonWallet.address,
+            splToken
+          );
+          setTokenBalance({
+            solana: new Big(solana.amount).div(Math.pow(10, solana.decimals)).toString(),
+            neon:neon.toString(),
+          });
+          break;
+        }
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [web3, splToken]);
+
+  const handleSubmit = useCallback(async () => {
+    if (token && splToken) {
+      setSubmitDisable(true);
+      const solanaSigner: Signer = toSigner(solanaWallet);
+      if (transfer.direction === "solana") {
+        switch (splToken.symbol) {
+          case "NEON": {
+            const transaction = await solanaNEONTransferTransaction(
+              solanaWallet.publicKey,
+              neonWallet.address,
+              neonProgram,
+              networkTokenMint,
+              splToken,
+              amount,
+              chainId
+            );
+            transaction.recentBlockhash = (
+              await connection.getLatestBlockhash()
+            ).blockhash;
+            const solana = await sendTransaction(
+              connection,
+              transaction,
+              [solanaSigner],
+              true,
+              { skipPreflight: false }
+            );
+            setSignature({ solana });
+            break;
+          }
+          case "SOL": {
+            const transaction = await solanaSOLTransferTransaction(
+              connection,
+              solanaWallet.publicKey,
+              neonWallet.address,
+              neonProgram,
+              networkTokenMint,
+              splToken,
+              amount,
+              chainId
+            );
+            transaction.recentBlockhash = (
+              await connection.getLatestBlockhash()
+            ).blockhash;
+            const solana = await sendTransaction(
+              connection,
+              transaction,
+              [solanaSigner],
+              true,
+              { skipPreflight: false }
+            );
+            setSignature({ solana });
+            break;
+          }
+          case "wSOL": {
+            const transaction = await neonTransferMintWeb3Transaction(
+              connection,
+              web3,
+              proxyApi,
+              proxyStatus,
+              neonProgram,
+              solanaWallet.publicKey,
+              neonWallet.address,
+              splToken,
+              amount,
+              chainId
+            );
+            transaction.recentBlockhash = (
+              await connection.getLatestBlockhash()
+            ).blockhash;
+            const solana = await sendTransaction(
+              connection,
+              transaction,
+              [solanaSigner],
+              true,
+              { skipPreflight: false }
+            );
+            setSignature({ solana });
+            break;
+          }
+          default: {
+            const transaction = await neonTransferMintWeb3Transaction(
+              connection,
+              web3,
+              proxyApi,
+              proxyStatus,
+              neonProgram,
+              solanaWallet.publicKey,
+              neonWallet.address,
+              splToken,
+              amount,
+              chainId
+            );
+            transaction.recentBlockhash = (
+              await connection.getLatestBlockhash()
+            ).blockhash;
+            const solana = await sendTransaction(
+              connection,
+              transaction,
+              [solanaSigner],
+              true,
+              { skipPreflight: false }
+            );
+            setSignature({ solana });
+            break;
+          }
+        }
+      } else {
+        const mintPubkey = new PublicKey(splToken.address_spl);
+        const associatedToken = getAssociatedTokenAddressSync(
+          mintPubkey,
+          solanaWallet.publicKey
+        );
+        switch (splToken.symbol) {
+          case "NEON": {
+            const transaction = await neonNeonTransaction(
+              web3,
+              neonWallet.address,
+              NEON_TRANSFER_CONTRACT_DEVNET,
+              solanaWallet.publicKey,
+              amount
+            );
+            const neon = await sendSignedTransaction(
+              web3,
+              transaction,
+              neonWallet
+            );
+            setSignature({ neon });
+            break;
+          }
+          case "SOL": {
+            const transaction = await neonNeonTransaction(
+              web3,
+              neonWallet.address,
+              SOL_TRANSFER_CONTRACT_DEVNET,
+              solanaWallet.publicKey,
+              amount
+            );
+            const neon = await sendSignedTransaction(
+              web3,
+              transaction,
+              neonWallet
+            );
+            setSignature({ neon });
+            break;
+          }
+          case "wSOL": {
+            const solanaTransaction = createMintSolanaTransaction(
+              solanaWallet.publicKey,
+              mintPubkey,
+              associatedToken,
+              NEON_STATUS_DEVNET_SNAPSHOT
+            );
+            const neonTransaction = await createMintNeonTransaction(
+              web3,
+              neonWallet.address,
+              associatedToken,
+              splToken,
+              amount
+            );
+            solanaTransaction.recentBlockhash = (
+              await connection.getLatestBlockhash()
+            ).blockhash;
+            const solana = await sendTransaction(
+              connection,
+              solanaTransaction,
+              [solanaSigner],
+              true,
+              { skipPreflight: false }
+            );
+            delay(1e3);
+            const neon = await sendSignedTransaction(
+              web3,
+              neonTransaction,
+              neonWallet
+            );
+            setSignature({ solana, neon });
+            break;
+          }
+          default: {
+            const solanaTransaction = createMintSolanaTransaction(
+              solanaWallet.publicKey,
+              mintPubkey,
+              associatedToken,
+              NEON_STATUS_DEVNET_SNAPSHOT
+            );
+            const neonTransaction = await createMintNeonTransaction(
+              web3,
+              neonWallet.address,
+              associatedToken,
+              splToken,
+              amount
+            );
+            solanaTransaction.recentBlockhash = (
+              await connection.getLatestBlockhash()
+            ).blockhash;
+            const solana = await sendTransaction(
+              connection,
+              solanaTransaction,
+              [solanaSigner],
+              true,
+              { skipPreflight: false }
+            );
+            delay(1e3);
+            const neon = await sendSignedTransaction(
+              web3,
+              neonTransaction,
+              neonWallet
+            );
+            setSignature({ solana, neon });
+            break;
+          }
+        }
+      }
+      await delay(1e3);
+      await getTokenBalance();
+      await getWalletBalance();
+      await delay(5e3);
+      setSubmitDisable(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    token,
+    splToken,
+    solanaWallet,
+    transfer.direction,
+    getTokenBalance,
+    getWalletBalance,
+    amount,
+    connection,
+    web3,
+    neonWallet,
+  ]);
+
+  useEffect(() => {
+    getProxyStatus();
+    getTokenBalance();
+    getWalletBalance();
+  }, [getProxyStatus, getTokenBalance, getWalletBalance, splToken]);
+
   return (
-    <main className="flex min-h-screen flex-col items-center justify-between p-24">
-      <div className="z-10 max-w-5xl w-full items-center justify-between font-mono text-sm lg:flex">
-        <p className="fixed left-0 top-0 flex w-full justify-center border-b border-gray-300 bg-gradient-to-b from-zinc-200 pb-6 pt-8 backdrop-blur-2xl dark:border-neutral-800 dark:bg-zinc-800/30 dark:from-inherit lg:static lg:w-auto  lg:rounded-xl lg:border lg:bg-gray-200 lg:p-4 lg:dark:bg-zinc-800/30">
-          Get started by editing&nbsp;
-          <code className="font-mono font-bold">app/page.tsx</code>
-        </p>
-        <div className="fixed bottom-0 left-0 flex h-48 w-full items-end justify-center bg-gradient-to-t from-white via-white dark:from-black dark:via-black lg:static lg:h-auto lg:w-auto lg:bg-none">
-          <a
-            className="pointer-events-none flex place-items-center gap-2 p-8 lg:pointer-events-auto lg:p-0"
-            href="https://vercel.com?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            By{' '}
-            <Image
-              src="/vercel.svg"
-              alt="Vercel Logo"
-              className="dark:invert"
-              width={100}
-              height={24}
-              priority
-            />
-          </a>
+    <div className="form-content">
+      <h1 className="title-1">
+        <i className="logo"></i>
+        <div className="flex flex-row items-center justify-between w-full">
+        <select
+  value={chainId}
+  onChange={handleEvmNetworkSelect}
+  className="evm-select"
+  disabled={submitDisable}
+>
+  <option value="" disabled selected>
+    Select token
+  </option>
+  {networkUrls.map((i) => (
+    <option value={i.id} key={i.id}>
+      {i.token} transfer
+    </option>
+  ))}
+</select>
+
+          <span className="text-[18px]">Nextjs demo</span>
         </div>
-      </div>
-
-      <div className="relative flex place-items-center before:absolute before:h-[300px] before:w-[480px] before:-translate-x-1/2 before:rounded-full before:bg-gradient-radial before:from-white before:to-transparent before:blur-2xl before:content-[''] after:absolute after:-z-20 after:h-[180px] after:w-[240px] after:translate-x-1/3 after:bg-gradient-conic after:from-sky-200 after:via-blue-200 after:blur-2xl after:content-[''] before:dark:bg-gradient-to-br before:dark:from-transparent before:dark:to-blue-700 before:dark:opacity-10 after:dark:from-sky-900 after:dark:via-[#0141ff] after:dark:opacity-40 before:lg:h-[360px] z-[-1]">
-        <Image
-          className="relative dark:drop-shadow-[0_0_0.3rem_#ffffff70] dark:invert"
-          src="/next.svg"
-          alt="Next.js Logo"
-          width={180}
-          height={37}
-          priority
-        />
-      </div>
-
-      <div className="mb-32 grid text-center lg:max-w-5xl lg:w-full lg:mb-0 lg:grid-cols-4 lg:text-left">
         <a
-          href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
+          href="https://github.com/neonlabsorg/neon-client-transfer/tree/master/examples/react/neon-transfer-react"
           target="_blank"
-          rel="noopener noreferrer"
+          rel="noreferrer"
         >
-          <h2 className={`mb-3 text-2xl font-semibold`}>
-            Docs{' '}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className={`m-0 max-w-[30ch] text-sm opacity-50`}>
-            Find in-depth information about Next.js features and API.
-          </p>
+          <i className="github"></i>
         </a>
+      </h1>
+      <form className="form mb-[20px]">
+        <div className="form-field">
+          <div className="flex flex-row gap-[8px] items-end">
+            <div>
+              <label
+                htmlFor="select"
+                className="form-label flax flex-row justify-between"
+              >
+                <span>From</span>
+                <span>({directionBalance("from")})</span>
+              </label>
+              <input
+                value={transfer.from}
+                className="form-input"
+                disabled={true}
+              ></input>
+            </div>
+            <div>
+              <button
+                className="icon-button"
+                type="button"
+                onClick={handleTransferDirection}
+              ></button>
+            </div>
+            <div>
+              <label
+                htmlFor="select"
+                className="form-label flax flex-row justify-between"
+              >
+                <span>To</span>
+                <span>({directionBalance("to")})</span>
+              </label>
+              <input
+                value={transfer.to}
+                className="form-input"
+                disabled={true}
+              ></input>
+            </div>
+          </div>
+        </div>
 
-        <a
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className={`mb-3 text-2xl font-semibold`}>
-            Learn{' '}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className={`m-0 max-w-[30ch] text-sm opacity-50`}>
-            Learn about Next.js in an interactive course with&nbsp;quizzes!
-          </p>
-        </a>
+        <div className="form-field">
+  <label htmlFor="select" className="form-label">
+    Select token
+  </label>
+  <select
+    value={token}
+    onChange={handleSelect}
+    className="form-select"
+    disabled={submitDisable}
+  >
+    <option value="" disabled={true}>
+      Select Token
+    </option>
+    {tokenList.map((i, k) => (
+      <option value={i.symbol} key={k}>
+        {i.name} ({i.symbol})
+      </option>
+    ))}
+  </select>
+</div>
 
-        <a
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
+        <div className="form-field">
+          <label
+            htmlFor="select"
+            className="form-label flex flex-row justify-between"
+          >
+            <span>Amount</span>
+            <span>{amountView}</span>
+          </label>
+          <input
+            value={amount}
+            onInput={handleAmount}
+            className="form-input"
+            placeholder="0"
+            disabled={true}
+          ></input>
+        </div>
+        <button
+          type="button"
+          className="form-button"
+          onClick={handleSubmit}
+          disabled={disabled}
         >
-          <h2 className={`mb-3 text-2xl font-semibold`}>
-            Templates{' '}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className={`m-0 max-w-[30ch] text-sm opacity-50`}>
-            Explore the Next.js 13 playground.
-          </p>
-        </a>
-
-        <a
-          href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template&utm_campaign=create-next-app"
-          className="group rounded-lg border border-transparent px-5 py-4 transition-colors hover:border-gray-300 hover:bg-gray-100 hover:dark:border-neutral-700 hover:dark:bg-neutral-800/30"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <h2 className={`mb-3 text-2xl font-semibold`}>
-            Deploy{' '}
-            <span className="inline-block transition-transform group-hover:translate-x-1 motion-reduce:transform-none">
-              -&gt;
-            </span>
-          </h2>
-          <p className={`m-0 max-w-[30ch] text-sm opacity-50`}>
-            Instantly deploy your Next.js site to a shareable URL with Vercel.
-          </p>
-        </a>
-      </div>
-    </main>
-  )
+          Submit
+        </button>
+      </form>
+      {(signature.solana || signature.neon) && (
+        <div className="flex flex-col gap-[10px] p-[12px] bg-[#282230] rounded-[12px] truncate">
+          {signature.solana && (
+            <a
+              href={solanaSignature(signature.solana)}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Solana: {stringShort(signature.solana, 40)}
+            </a>
+          )}
+          {signature.neon && (
+            <a
+              href={neonSignature(signature.neon)}
+              target="_blank"
+              rel="noreferrer"
+            >
+              Neon: {stringShort(signature.neon, 40)}
+            </a>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }
+
+export default NeonTransferApp;
